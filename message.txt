@@ -1,0 +1,234 @@
+-- roblox_dump_full.lua — final fix
+-- ใช้ข้อมูลจาก debug: ทุก section OK แยก แต่ merge พัง
+-- fix: encode แยก → merge string → writefile
+
+local HttpService = game:GetService("HttpService")
+local Players     = game:GetService("Players")
+local RunService  = game:GetService("RunService")
+
+local function safeGet(fn, ...)
+    local ok, res = pcall(fn, ...)
+    if ok then return res end
+    return nil
+end
+
+local function safeRead(inst, prop)
+    local ok, val = pcall(function() return inst[prop] end)
+    if ok then return val end
+    return nil
+end
+
+local function toAddr(inst)
+    return tostring(inst):gsub("userdata: ", "")
+end
+
+local function getFullName(inst)
+    return safeGet(function() return inst:GetFullName() end) or "?"
+end
+
+local function safeWait(t)
+    if task and task.wait then task.wait(t) else wait(t) end
+end
+
+local canWrite = false
+do
+    local ok = pcall(writefile, "write_test.txt", "ok")
+    canWrite = ok
+end
+
+------------------------------------------------------------------------
+-- ALL SERVICES
+------------------------------------------------------------------------
+
+local function getAllServiceNames()
+    local names      = {}
+    local seen_names = {}
+    for _, child in ipairs(safeGet(function() return game:GetChildren() end) or {}) do
+        local name = safeRead(child, "Name")
+        if name and not seen_names[name] then
+            seen_names[name] = true
+            table.insert(names, name)
+        end
+    end
+    local knownServices = {
+        "Workspace","Players","Lighting","ReplicatedStorage","ReplicatedFirst",
+        "ServerStorage","ServerScriptService","StarterGui","StarterPack","StarterPlayer",
+        "SoundService","Chat","Teams","TestService","RunService","HttpService",
+        "UserInputService","GuiService","MarketplaceService","BadgeService",
+        "GroupService","ContextActionService","TweenService","PhysicsService",
+        "CollectionService","DataStoreService","MemoryStoreService",
+        "MessagingService","PathfindingService","PolicyService","TextService",
+        "VoiceChatService","CoreGui","RobloxReplicatedStorage",
+        "InsertService","ScriptContext","Stats",
+        "LocalizationService","KeyframeSequenceProvider","ContentProvider",
+        "LogService","AssetService","AvatarEditorService","CaptureService",
+        "GeometryService","HapticService","HttpRbxApiService",
+        "NotificationService","ProximityPromptService","RenderSettings",
+        "SharedTableRegistry","TeleportService","TextChatService",
+        "TouchInputService","UserService","VRService","VideoService",
+    }
+    for _, svcName in ipairs(knownServices) do
+        if not seen_names[svcName] then
+            seen_names[svcName] = true
+            table.insert(names, svcName)
+        end
+    end
+    return names
+end
+
+------------------------------------------------------------------------
+-- REMOTES
+------------------------------------------------------------------------
+
+local function dumpRemotes(serviceNames)
+    local remotes    = {}
+    local remoteSeen = {}
+    local function scanFolder(folder)
+        if not folder then return end
+        for _, child in ipairs(safeGet(function() return folder:GetDescendants() end) or {}) do
+            local class = safeRead(child, "ClassName") or ""
+            if class == "RemoteFunction" or class == "RemoteEvent"
+            or class == "UnreliableRemoteEvent"
+            or class == "BindableEvent" or class == "BindableFunction" then
+                local addr = toAddr(child)
+                if not remoteSeen[addr] then
+                    remoteSeen[addr] = true
+                    table.insert(remotes, {
+                        className = class,
+                        name      = safeRead(child, "Name"),
+                        fullName  = getFullName(child),
+                        address   = addr,
+                        parent    = safeRead(child.Parent, "Name"),
+                    })
+                end
+            end
+        end
+    end
+    for _, svcName in ipairs(serviceNames) do
+        local svc = safeGet(function() return game:GetService(svcName) end)
+        if svc then scanFolder(svc) end
+    end
+    return remotes
+end
+
+------------------------------------------------------------------------
+-- PLAYERS
+------------------------------------------------------------------------
+
+local function dumpPlayers()
+    local list = {}
+    for _, player in ipairs(safeGet(function() return Players:GetPlayers() end) or {}) do
+        local pdata = {
+            name           = safeRead(player, "Name"),
+            displayName    = safeRead(player, "DisplayName"),
+            userId         = safeRead(player, "UserId"),
+            accountAge     = safeRead(player, "AccountAge"),
+            membershipType = tostring(safeRead(player, "MembershipType")),
+            leaderstats    = nil,
+        }
+        local ls = safeGet(function() return player:FindFirstChild("leaderstats") end)
+        if ls then
+            pdata.leaderstats = {}
+            for _, stat in ipairs(safeGet(function() return ls:GetChildren() end) or {}) do
+                local v = safeGet(function() return stat.Value end)
+                pdata.leaderstats[safeRead(stat,"Name") or "?"] = tostring(v)
+            end
+        end
+        table.insert(list, pdata)
+    end
+    return list
+end
+
+------------------------------------------------------------------------
+-- SERVICES — shallow depth 1
+------------------------------------------------------------------------
+
+local function dumpServices(serviceNames)
+    local snap = {}
+    for _, name in ipairs(serviceNames) do
+        local svc = safeGet(function() return game:GetService(name) end)
+        if svc then
+            local children = safeGet(function() return svc:GetChildren() end) or {}
+            local childList = {}
+            for _, child in ipairs(children) do
+                table.insert(childList, {
+                    name      = safeRead(child, "Name"),
+                    className = safeRead(child, "ClassName"),
+                })
+            end
+            snap[name] = { childCount=#childList, children=childList }
+        else
+            snap[name] = { _error="nil" }
+        end
+    end
+    return snap
+end
+
+------------------------------------------------------------------------
+-- META
+------------------------------------------------------------------------
+
+local function dumpMeta()
+    return {
+        gameId       = safeRead(game, "GameId"),
+        placeId      = safeRead(game, "PlaceId"),
+        placeVersion = safeRead(game, "PlaceVersion"),
+        jobId        = safeRead(game, "JobId"),
+        creatorId    = safeRead(game, "CreatorId"),
+        clientTime   = tick(),
+        isStudio     = RunService:IsStudio(),
+        isClient     = RunService:IsClient(),
+    }
+end
+
+------------------------------------------------------------------------
+-- MAIN — encode แยก แล้ว stitch เป็น json เดียว
+------------------------------------------------------------------------
+
+local function main()
+    print("[6larping7] building dump...")
+    local serviceNames = getAllServiceNames()
+    print("[6larping7] services: " .. #serviceNames)
+    safeWait(0.05)
+
+    -- encode แยกทีละ section
+    local sections = {
+        { key="meta",         data=dumpMeta() },
+        { key="serviceNames", data=serviceNames },
+        { key="remotes",      data=dumpRemotes(serviceNames) },
+        { key="players",      data=dumpPlayers() },
+        { key="services",     data=dumpServices(serviceNames) },
+    }
+
+    local parts = {}
+    for _, section in ipairs(sections) do
+        local ok, json = pcall(function()
+            return HttpService:JSONEncode(section.data)
+        end)
+        if ok then
+            print("[OK] " .. section.key .. " — " .. math.floor(#json/1024) .. " KB")
+            table.insert(parts, string.format("%q", section.key) .. ":" .. json)
+        else
+            warn("[FAIL] " .. section.key .. " — " .. tostring(json))
+            table.insert(parts, string.format("%q", section.key) .. ":null")
+        end
+        safeWait(0.05)
+    end
+
+    -- stitch เป็น json object เดียว
+    local finalJson = "{" .. table.concat(parts, ",") .. "}"
+    print("[6larping7] total size: " .. math.floor(#finalJson/1024) .. " KB")
+
+    if canWrite then
+        local wOk, wErr = pcall(writefile, "roblox_dump.json", finalJson)
+        if wOk then
+            print("[+] saved → roblox_dump.json (" .. math.floor(#finalJson/1024) .. " KB)")
+        else
+            warn("[!] writefile failed: " .. tostring(wErr))
+        end
+    else
+        warn("[!] writefile nil")
+    end
+end
+
+main()
